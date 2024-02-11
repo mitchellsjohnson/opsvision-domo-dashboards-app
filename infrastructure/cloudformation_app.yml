@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters: 
+  GithubOwner:
+    Type: String
+    Default: "team-opsvision"
+  GitHubRepo:
+    Type: String
+    Default: "opsvision-domo-dashboards-app"
+  CodeStarConnectionArn:
+    Description: Codestar connection arn to pull repo
+    Type: String
+  GitHubBranch:
+    Type: String
+    Default: main
+    AllowedPattern: "[A-Za-z0-9-]+"
+  Env:
+    Description: 'The env level to which this stack is being deployed (i.e. Dev/Prod)'
+    Type: 'String'
+    Default: PersonalDev
+    AllowedValues:
+      - PersonalDev
+      - Prod
+Conditions:
+  isProd: !Equals [ !Ref Env, Prod ]
+  isPersonalDev: !Equals [!Ref Env, PersonalDev]
+
+Resources:
+  CodePipeline:
+    Type: 'AWS::CodePipeline::Pipeline'
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Location: !Ref PipelineBucket
+        Type: S3
+      Stages:
+        - Actions:
+            - InputArtifacts: []
+              ActionTypeId:
+                Version: '1'
+                Owner: AWS
+                Category: Source
+                Provider: CodeStarSourceConnection
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+              Configuration:
+                ConnectionArn: !Ref 'CodeStarConnectionArn'
+                FullRepositoryId: !Sub "${GithubOwner}/${GitHubRepo}"
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: "CODE_ZIP"
+              Name: ApplicationSource
+          Name: "Source"
+        - 
+          Name: Build
+          Actions: 
+            - 
+              Name: BuildAction
+              ActionTypeId: 
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              InputArtifacts: 
+                - 
+                  Name: SourceArtifact
+              OutputArtifacts: 
+                - 
+                  Name: BuildArtifact
+              Configuration:
+                ProjectName: !Ref CodeBuild
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - "codebuild.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: /service-role/
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                Resource: 
+                  - !GetAtt PipelineBucket.Arn
+                  - !Join ['', [!GetAtt PipelineBucket.Arn, "/*"]]
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject"
+                  - "s3:PutObjectAcl"
+                  - "s3:ListBucket"
+                Resource: 
+                  - !GetAtt DeployBucket.Arn
+                  - !Join ['', [!GetAtt DeployBucket.Arn, "/*"]]
+              -
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "cloudfront:CreateInvalidation"
+                Resource:
+                  - "*"
+              -
+                Effect: Allow
+                Action:
+                  - "ssm:GetParameters"
+                Resource:
+                  - !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter/okta-issuer-default"
+                  - !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter/opsvision-frontend-client-id"
+              - 
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: 
+                  - !Sub "arn:aws:secretsmanager:us-east-1:${AWS::AccountId}:secret:OpsvisionDomoDashboard_Config-*"
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - 
+            Effect: Allow
+            Principal:
+              Service:
+                - "codepipeline.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+              - 
+                Effect: Allow
+                Action:
+                  - "s3:GetObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:GetBucketVersioning"
+                  - "s3:PutObject*"
+                Resource: 
+                  - !GetAtt PipelineBucket.Arn
+                  - !Join ['', [!GetAtt PipelineBucket.Arn, "/*"]]
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                  - codestar-connections:PassedToService
+                Resource: !Ref 'CodeStarConnectionArn'
+              - 
+                Effect: Allow  
+                Action:
+                  - "codebuild:BatchGetBuilds"
+                  - "codebuild:StartBuild"
+                Resource: "*"
+  CodeBuild:
+    Type: 'AWS::CodeBuild::Project'
+    Properties:
+      Name: !Sub ${AWS::StackName}-CodeBuild
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        OverrideArtifactName: false
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:5.0
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: !Sub |
+          version: 0.2
+          env:
+            parameter-store:
+              OKTA_ISSUER: okta-issuer-default
+              OKTA_CLIENT_ID: opsvision-frontend-client-id
+            secrets-manager:
+              REACT_APP_SERVER_BASE_URL: OpsvisionDomoDashboard_Config:REACT_APP_SERVER_BASE_URL
+              REACT_APP_DOMO_DASHBOARD1_EMBED_ID: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD1_EMBED_ID
+              REACT_APP_DOMO_DASHBOARD2_EMBED_ID: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD2_EMBED_ID
+              REACT_APP_DOMO_DASHBOARD3_EMBED_ID: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD3_EMBED_ID
+              REACT_APP_DOMO_DASHBOARD4_EMBED_ID: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD4_EMBED_ID
+              REACT_APP_DOMO_DASHBOARD5_EMBED_ID: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD5_EMBED_ID
+              REACT_APP_DOMO_DASHBOARD6_EMBED_ID: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD6_EMBED_ID
+              REACT_APP_DOMO_DASHBOARD1_NAME: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD1_NAME
+              REACT_APP_DOMO_DASHBOARD2_NAME: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD2_NAME
+              REACT_APP_DOMO_DASHBOARD3_NAME: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD3_NAME
+              REACT_APP_DOMO_DASHBOARD4_NAME: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD4_NAME
+              REACT_APP_DOMO_DASHBOARD5_NAME: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD5_NAME
+              REACT_APP_DOMO_DASHBOARD6_NAME: OpsvisionDomoDashboard_Config:REACT_APP_DOMO_DASHBOARD6_NAME
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 14
+            pre_build:
+              commands:
+                - echo pre-build directory after change `pwd`
+                - echo Installing source NPM dependencies...
+                - node -v
+                - npm install
+            build:
+              commands:
+                - echo Build started on `date`
+                - npm run build 
+            post_build:
+              commands:
+                - aws s3 cp --recursive ./build s3://${DeployBucket}/
+                - aws s3 cp --cache-control="max-age=0, no-cache, no-store, must-revalidate" ./build/registerServiceWorker.js s3://${DeployBucket}/
+                - aws s3 cp --cache-control="max-age=0, no-cache, no-store, must-revalidate" ./build/index.html s3://${DeployBucket}/
+                - aws cloudfront create-invalidation --distribution-id ${Distribution} --paths /index.html /registerServiceWorker.js
+          artifacts:
+            files:
+              - '**/*'
+            base-directory: build
+  PipelineBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties: 
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ArtifactBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref PipelineBucket
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:*'
+            Effect: Deny
+            Resource: !Sub "${PipelineBucket.Arn}/*"
+            Principal: '*'
+            Condition:
+              Bool: 
+                "aws:SecureTransport": "false"
+          - Action:
+              - 's3:Get*'
+              - 's3:Put*'
+            Effect: Allow
+            Resource: !Sub "${PipelineBucket.Arn}/*"
+            Principal:
+              AWS: !GetAtt CodeBuildRole.Arn
+          - Action:
+              - 's3:ListBucket'
+            Effect: Allow
+            Resource: !GetAtt PipelineBucket.Arn
+            Principal:
+              AWS: '*'
+            Condition:
+              StringLike:
+                'aws:PrincipalArn':
+                  - !GetAtt CodeBuildRole.Arn
+
+
+  DeployBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DeployBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref DeployBucket 
+      PolicyDocument:
+        Statement:
+          - Action:
+              - 's3:*'
+            Effect: Deny
+            Resource: !Sub "${DeployBucket.Arn}/*"
+            Principal: '*'
+            Condition:
+              Bool: 
+                "aws:SecureTransport": "false"
+          - Action:
+              - 's3:Get*'
+              - 's3:Put*'
+            Effect: Allow
+            Resource: 
+              - !Sub "${DeployBucket.Arn}/*"
+            Principal:
+              AWS: !GetAtt CodeBuildRole.Arn
+          - Action:
+              - 's3:GetObject'
+            Effect: Allow
+            Resource: 
+              - !Sub "${DeployBucket.Arn}/*"
+            Principal:
+              CanonicalUser: !GetAtt DistributionOriginAccessIdentity.S3CanonicalUserId
+          - Action:
+              - 's3:ListBucket'
+            Effect: Allow
+            Resource: !GetAtt DeployBucket.Arn
+            Principal:
+              AWS: '*'
+            Condition:
+              StringLike:
+                'aws:PrincipalArn':
+                  - !GetAtt CodeBuildRole.Arn
+
+
+  DistributionOriginAccessIdentity:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties: 
+      CloudFrontOriginAccessIdentityConfig: 
+        Comment: "Identity with permission to retrieve Opsvision App from S3"
+
+  Distribution:
+    Type: "AWS::CloudFront::Distribution"
+    Condition: isProd
+    Properties:
+      DistributionConfig:
+        Origins:
+          - 
+            DomainName: !GetAtt DeployBucket.DomainName
+            Id: !Ref DeployBucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${DistributionOriginAccessIdentity}"
+        DefaultRootObject: index.html
+        Enabled: true
+        DefaultCacheBehavior: 
+          MinTTL: 86400
+          MaxTTL: 31536000
+          ForwardedValues: 
+            QueryString: true
+          TargetOriginId: !Ref DeployBucket
+          ViewerProtocolPolicy: "redirect-to-https"
+        CustomErrorResponses:
+          -
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: "/index.html"
+        Restrictions:
+          GeoRestriction: 
+            RestrictionType: whitelist
+            Locations:
+              - LT
+              - US
+              - GB
+        Aliases: [ "opsvision.maxex.com" ]
+        ViewerCertificate: 
+          AcmCertificateArn: "arn:aws:acm:us-east-1:999630474676:certificate/dab269c6-03dc-4a42-b56a-a52ac3334a91"
+          SslSupportMethod: "sni-only"
+        PriceClass: "PriceClass_100" # North America and Europe
+
+  PersonalDevDistribution:
+    Type: "AWS::CloudFront::Distribution"
+    Condition: isPersonalDev
+    Properties:
+      DistributionConfig:
+        Origins:
+          - 
+            DomainName: !GetAtt DeployBucket.DomainName
+            Id: !Ref DeployBucket
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${DistributionOriginAccessIdentity}"
+        DefaultRootObject: index.html
+        Enabled: true
+        DefaultCacheBehavior: 
+          MinTTL: 86400
+          MaxTTL: 31536000
+          ForwardedValues: 
+            QueryString: true
+          TargetOriginId: !Ref DeployBucket
+          ViewerProtocolPolicy: "redirect-to-https"
+        CustomErrorResponses:
+          -
+            ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: "/index.html"
+        Restrictions:
+          GeoRestriction: 
+            RestrictionType: whitelist
+            Locations:
+              - LT
+              - US
+              - GB
+        PriceClass: "PriceClass_100" # North America and Europe
+
+      Tags:
+        - Key: Service
+          Value: opsvision
